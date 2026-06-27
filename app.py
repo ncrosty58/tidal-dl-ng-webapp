@@ -6,8 +6,7 @@ import threading
 import queue
 import logging
 from pathlib import Path
-from flask import Flask, render_template, request, Response, send_from_directory, abort
-from flask import Flask, Response, request
+from flask import Flask, render_template, request, Response, send_from_directory
 from typing import cast
 
 # Optional TOML config support: prefer stdlib `tomllib` (Python 3.11+), fall back to `tomli` if available
@@ -134,6 +133,11 @@ def download():
         logging.error("No URL provided")
         return {"error": "No URL provided"}, 400
 
+    url = url.strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        logging.error(f"Invalid URL provided: {url}")
+        return {"error": "Invalid URL provided"}, 400
+
     def run_download():
         global current_process
         try:
@@ -252,6 +256,12 @@ def download():
 
 @app.route('/tidal-dl/stop', methods=['POST'])
 def stop():
+    if DOWNLOAD_TOKEN:
+        token = request.headers.get('X-Download-Token')
+        if token != DOWNLOAD_TOKEN:
+            logging.warning('Unauthorized stop attempt (invalid/missing token)')
+            return ({"error": "Unauthorized"}, 401)
+
     global current_process
     with process_lock:
         if current_process:
