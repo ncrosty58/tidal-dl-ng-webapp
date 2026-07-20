@@ -1,11 +1,14 @@
 import os
 import subprocess
 import shutil
-import time
+import signal
 import threading
 import queue
+import hmac
 import logging
+from collections import deque
 from pathlib import Path
+from urllib.parse import urlparse
 from flask import Flask, render_template, request, Response, send_from_directory
 from typing import cast
 
@@ -92,11 +95,63 @@ TIDAL_DL_BIN = _cfg['TIDAL_DL_BIN']
 DOWNLOAD_TIMEOUT = _cfg['DOWNLOAD_TIMEOUT']  # seconds; 0 = no timeout
 DOWNLOAD_TOKEN = _cfg['DOWNLOAD_TOKEN']  # optional: if set, require header X-Download-Token
 
-# Store output in a bounded queue for streaming (prevents unbounded memory growth)
-output_queue = queue.Queue(maxsize=2000)
+# Output is broadcast to every connected SSE client rather than consumed from
+# a single shared queue, so multiple tabs/devices (or a page refresh) each
+# see the full log instead of splitting it between whichever client happens
+# to read a given line first.
+HISTORY_MAXLEN = 500
+output_history = deque(maxlen=HISTORY_MAXLEN)
+subscribers = set()  # set of per-client queue.Queue, guarded by subscribers_lock
+subscribers_lock = threading.Lock()
+
 # current_process is protected by process_lock
 current_process = None
 process_lock = threading.Lock()
+
+# TIDAL URLs only; keeps the wrapped binary from being pointed at arbitrary hosts
+ALLOWED_URL_HOSTS = {"tidal.com", "www.tidal.com", "listen.tidal.com"}
+
+
+def _broadcast(line):
+    """Append a line to history and push it to every connected SSE subscriber."""
+    with subscribers_lock:
+        output_history.append(line)
+        subs = list(subscribers)
+    for q in subs:
+        try:
+            q.put_nowait(line)
+        except queue.Full:
+            # slow subscriber: drop its oldest buffered line to make room
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(line)
+            except queue.Full:
+                pass
+
+
+def _terminate_process_group(process, grace_seconds=5):
+    """Terminate a subprocess and its whole process group (e.g. ffmpeg
+    children it spawned), escalating to SIGKILL if it doesn't exit in time."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            os.killpg(pgid, signal.SIGKILL)
+            process.wait()
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        logging.error(f"Error terminating process group: {e}")
 
 # Validate binary at startup (log warnings but do not crash)
 _resolved_bin = shutil.which(TIDAL_DL_BIN)
@@ -119,52 +174,62 @@ def favicon():
     # in `_load_config()` and want to satisfy the type checker.
     return send_from_directory(cast(str, app.static_folder), 'favicon.ico')
 
+def _check_token():
+    """Return an (error_response, status) tuple if DOWNLOAD_TOKEN is set and
+    missing/incorrect, else None."""
+    if not DOWNLOAD_TOKEN:
+        return None
+    token = request.headers.get('X-Download-Token') or ''
+    if not hmac.compare_digest(token, DOWNLOAD_TOKEN):
+        logging.warning('Unauthorized request (invalid/missing token)')
+        return {"error": "Unauthorized"}, 401
+    return None
+
+
 @app.route('/download', methods=['POST'])
 @app.route('/tidal-dl/download', methods=['POST'])
 def download():
     global current_process
-    # optional token auth: if DOWNLOAD_TOKEN is set, require header
-    if DOWNLOAD_TOKEN:
-        token = request.headers.get('X-Download-Token')
-        if token != DOWNLOAD_TOKEN:
-            logging.warning('Unauthorized download attempt (invalid/missing token)')
-            return ({"error": "Unauthorized"}, 401)
+
+    auth_error = _check_token()
+    if auth_error:
+        return auth_error
+
     url = request.form.get('url')
     if not url:
         logging.error("No URL provided")
         return {"error": "No URL provided"}, 400
 
     url = url.strip()
-    if not url.startswith("http://") and not url.startswith("https://"):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ALLOWED_URL_HOSTS:
         logging.error(f"Invalid URL provided: {url}")
         return {"error": "Invalid URL provided"}, 400
 
     def run_download():
         global current_process
+        process = None
         try:
             logging.info(f"Starting download for URL: {url}")
-            # Clear previous output (non-atomic but reasonable)
-            try:
-                while True:
-                    output_queue.get_nowait()
-            except queue.Empty:
-                pass
+            with subscribers_lock:
+                output_history.clear()
 
-            # Run tidal-dl-ng
+            # Run tidal-dl-ng. start_new_session=True makes it (and any
+            # children it spawns, e.g. ffmpeg) the leader of its own process
+            # group so Stop/timeout can terminate the whole tree, not just
+            # the immediate process.
             command = [TIDAL_DL_BIN, 'dl', url]
-            process = None
             with process_lock:
-                # Start process and register it as the current process
                 process = subprocess.Popen(
                     command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    start_new_session=True,
                 )
                 current_process = process
 
-            # Read lines robustly
             try:
                 stdout = process.stdout
                 if stdout is None:
@@ -173,110 +238,59 @@ def download():
                     for line in iter(stdout.readline, ''):
                         if line == '':
                             break
-                        # best-effort non-blocking put: drop oldest if full
-                        try:
-                            output_queue.put(line, timeout=0.5)
-                        except queue.Full:
-                            try:
-                                _ = output_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                            try:
-                                output_queue.put_nowait(line)
-                            except queue.Full:
-                                # if still full, discard
-                                pass
+                        _broadcast(line)
 
-                # Wait for completion (configurable)
                 if DOWNLOAD_TIMEOUT and DOWNLOAD_TIMEOUT > 0:
                     try:
                         process.wait(timeout=DOWNLOAD_TIMEOUT)
                     except subprocess.TimeoutExpired:
-                        output_queue.put("Error: Command timed out")
+                        _broadcast("Error: Command timed out")
                         logging.error("Command timed out")
-                        # attempt graceful termination below
+                        _terminate_process_group(process)
                 else:
                     process.wait()
 
                 if process.returncode == 0:
-                    output_queue.put("Download completed successfully")
+                    _broadcast("Download completed successfully")
                     logging.info("Download completed successfully")
                 else:
-                    output_queue.put(f"Error: Download failed (exit {process.returncode})")
+                    _broadcast(f"Error: Download failed (exit {process.returncode})")
                     logging.error(f"Download failed (exit {process.returncode})")
             finally:
-                # Ensure process pipe is closed
                 try:
-                    if process and process.stdout:
+                    if process.stdout:
                         process.stdout.close()
                 except Exception:
                     pass
                 with process_lock:
                     if current_process is process:
                         current_process = None
-        except subprocess.TimeoutExpired:
-            output_queue.put("Error: Command timed out")
-            logging.error("Command timed out")
-            # Attempt graceful termination
-            try:
-                if process:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-            except Exception as e:
-                logging.error(f"Error terminating process after timeout: {e}")
-            with process_lock:
-                if current_process is process:
-                    current_process = None
         except Exception as e:
-            output_queue.put(f"Error: {str(e)}")
+            _broadcast(f"Error: {str(e)}")
             logging.error(f"Error in download: {str(e)}")
             with process_lock:
                 if current_process is process:
                     current_process = None
 
-    # Stop any existing process (safely)
+    # Stop any existing process (safely) before starting the new one
     with process_lock:
-        if current_process:
-            try:
-                current_process.terminate()
-                try:
-                    current_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    current_process.kill()
-                    current_process.wait()
-            except Exception as e:
-                logging.error(f"Error stopping previous process: {e}")
-            current_process = None
-    # Start new download
+        _terminate_process_group(current_process)
+        current_process = None
     threading.Thread(target=run_download, daemon=True).start()
     return {"message": "Download started"}, 200
 
 @app.route('/tidal-dl/stop', methods=['POST'])
 def stop():
-    if DOWNLOAD_TOKEN:
-        token = request.headers.get('X-Download-Token')
-        if token != DOWNLOAD_TOKEN:
-            logging.warning('Unauthorized stop attempt (invalid/missing token)')
-            return ({"error": "Unauthorized"}, 401)
+    auth_error = _check_token()
+    if auth_error:
+        return auth_error
 
     global current_process
     with process_lock:
         if current_process:
-            try:
-                current_process.terminate()
-                try:
-                    current_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    current_process.kill()
-                    current_process.wait()
-            except Exception as e:
-                logging.error(f"Error stopping process: {e}")
+            _terminate_process_group(current_process)
             current_process = None
-            output_queue.put("Download stopped")
+            _broadcast("Download stopped")
             logging.info("Download stopped")
             return {"message": "Download stopped"}, 200
     return {"message": "No download running"}, 200
@@ -284,18 +298,30 @@ def stop():
 @app.route('/tidal-dl/stream', methods=['GET'])
 @app.route('/stream', methods=['GET'])
 def stream():
+    # Each connection gets its own queue and a replay of recent history, so
+    # multiple tabs/devices (or a reconnect after a page refresh) each see
+    # the full log instead of splitting one shared stream between them.
+    client_queue = queue.Queue(maxsize=1000)
+    with subscribers_lock:
+        subscribers.add(client_queue)
+        history_snapshot = list(output_history)
+
     def generate():
         try:
             yield ': keep-alive\n\n'
+            for line in history_snapshot:
+                yield f"data: {line}\n\n"
             while True:
                 try:
-                    line = output_queue.get(timeout=0.5)
+                    line = client_queue.get(timeout=0.5)
                     yield f"data: {line}\n\n"
                 except queue.Empty:
                     yield ': keep-alive\n\n'
-                    time.sleep(0.5)
         except GeneratorExit:
             logging.info("SSE stream closed")
+        finally:
+            with subscribers_lock:
+                subscribers.discard(client_queue)
 
     return Response(
         generate(),

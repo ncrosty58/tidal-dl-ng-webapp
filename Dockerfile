@@ -16,6 +16,7 @@ RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev && \
     apk del .build-deps
 
 COPY . .
+RUN chmod +x docker-entrypoint.sh
 
 # Run as a non-root user; uid 1000 matches the typical host owner of the
 # bind-mounted downloads volume and the tidal_dl_ng config volume.
@@ -36,6 +37,8 @@ EXPOSE 5050
 # manifest.json is served without touching tidal-dl-ng, so it's a cheap liveness probe.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD wget -qO /dev/null http://127.0.0.1:5050/static/manifest.json || exit 1
+
+ENTRYPOINT ["./docker-entrypoint.sh"]
 
 # Single worker (the in-process output_queue/current_process state assumes one
 # process); gthread keeps the SSE stream and concurrent requests responsive.

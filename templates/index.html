@@ -37,6 +37,7 @@
                     type="text"
                     id="url"
                     placeholder="Enter Tidal URL"
+                    aria-label="Tidal URL"
                     class="w-full pr-12 p-3 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 />
                 <button
@@ -50,8 +51,9 @@
                 </button>
             </div>
             <button
+                id="go-button"
                 onclick="startDownload()"
-                class="px-6 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                class="px-6 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-600"
             >
                 Go
             </button>
@@ -65,6 +67,9 @@
         </div>
         <div
             id="output"
+            role="log"
+            aria-live="polite"
+            aria-atomic="false"
             class="bg-gray-700 p-4 rounded-lg border border-gray-600 max-h-80 overflow-y-auto text-sm font-mono text-gray-200"
         ></div>
     </div>
@@ -84,12 +89,24 @@
         let retryCount = 0;
         const maxRetries = 3;
 
+        // Messages the server sends to mark a job as finished, so the UI can
+        // reset itself without the user having to click Stop.
+        function isTerminalMessage(msg) {
+            return msg === 'Download completed successfully'
+                || msg === 'Download stopped'
+                || msg.startsWith('Error:');
+        }
+
+        function setRunningState(isRunning) {
+            document.getElementById('go-button').disabled = isRunning;
+            document.getElementById('stop-button').classList.toggle('hidden', !isRunning);
+        }
+
         async function startDownload() {
             const url = document.getElementById('url').value;
             const outputDiv = document.getElementById('output');
-            const stopButton = document.getElementById('stop-button');
             outputDiv.textContent = 'Processing...';
-            stopButton.classList.remove('hidden');
+            setRunningState(true);
 
             if (eventSource) {
                 eventSource.close();
@@ -107,14 +124,14 @@
                 const result = await response.json();
                 if (!response.ok) {
                     outputDiv.textContent = 'Error: ' + result.error + '\n';
-                    stopButton.classList.add('hidden');
+                    setRunningState(false);
                     return;
                 }
 
                 connectStream();
             } catch (error) {
                 outputDiv.textContent = 'Error: ' + error.message + '\n';
-                stopButton.classList.add('hidden');
+                setRunningState(false);
             }
         }
 
@@ -127,15 +144,20 @@
 
         function connectStream() {
             const outputDiv = document.getElementById('output');
-            const stopButton = document.getElementById('stop-button');
             eventSource = new EventSource('/tidal-dl/stream');
 
             eventSource.onmessage = function(event) {
-                if (event.data !== 'keep-alive') {
-                    outputDiv.textContent += event.data + '\n';
-                    outputDiv.scrollTop = outputDiv.scrollHeight;
-                }
+                if (event.data === 'keep-alive') return;
+
+                outputDiv.textContent += event.data + '\n';
+                outputDiv.scrollTop = outputDiv.scrollHeight;
                 retryCount = 0;
+
+                if (isTerminalMessage(event.data)) {
+                    eventSource.close();
+                    eventSource = null;
+                    setRunningState(false);
+                }
             };
 
             eventSource.onerror = function() {
@@ -149,7 +171,7 @@
                     outputDiv.textContent += 'Error: Failed to connect to stream\n';
                     eventSource.close();
                     eventSource = null;
-                    stopButton.classList.add('hidden');
+                    setRunningState(false);
                 }
             };
         }
@@ -158,19 +180,14 @@
             if (eventSource) {
                 eventSource.close();
                 eventSource = null;
-                const outputDiv = document.getElementById('output');
-                outputDiv.textContent += 'Stream stopped\n';
-                document.getElementById('stop-button').classList.add('hidden');
-                try {
-                    await fetch('/tidal-dl/stop', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                        }
-                    });
-                } catch (error) {
-                    outputDiv.textContent += 'Error stopping download: ' + error.message + '\n';
-                }
+            }
+            const outputDiv = document.getElementById('output');
+            outputDiv.textContent += 'Stream stopped\n';
+            setRunningState(false);
+            try {
+                await fetch('/tidal-dl/stop', { method: 'POST' });
+            } catch (error) {
+                outputDiv.textContent += 'Error stopping download: ' + error.message + '\n';
             }
         }
     </script>
