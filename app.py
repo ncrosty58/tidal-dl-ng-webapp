@@ -55,8 +55,8 @@ def _load_config():
         key = (cfg_key or name).lower()
         return cfg.get(key, default)
 
-    TEMPLATE_FOLDER = _env_or_cfg('TEMPLATE_FOLDER', 'template_folder', default_dir)
-    STATIC_FOLDER = _env_or_cfg('STATIC_FOLDER', 'static_folder', default_dir)
+    TEMPLATE_FOLDER = _env_or_cfg('TEMPLATE_FOLDER', 'template_folder', os.path.join(default_dir, 'templates'))
+    STATIC_FOLDER = _env_or_cfg('STATIC_FOLDER', 'static_folder', os.path.join(default_dir, 'static'))
     TIDAL_DL_BIN = _env_or_cfg('TIDAL_DL_BIN', 'tidal_dl_bin', 'tidal-dl-ng')
     # download timeout may be int in TOML; ensure string/env handled
     _dt = _env_or_cfg('DOWNLOAD_TIMEOUT', 'download_timeout', 0)
@@ -112,6 +112,7 @@ def index_tidal():
     return render_template('index.html')
 
 @app.route('/favicon.ico')
+@app.route('/tidal-dl/favicon.ico')
 def favicon():
     # `app.static_folder` can be typed as `Optional[str]` by type-checkers;
     # cast to `str` here because we always provide a default static folder

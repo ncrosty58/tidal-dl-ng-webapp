@@ -1,27 +1,27 @@
-version: '3.8'
 services:
   tidal-dl:
     build: .
-    image: ncrosty58/tidal-dl:latest
+    image: tidal-dl:latest
+    container_name: tidal-dl
+    restart: always
     ports:
-      - "${HOST_PORT:-5050}:${CONTAINER_PORT:-5050}"
-    # Example: mount a system config so the container reads /etc/tidal-dl/config.toml
-    # The app will prefer environment variables over TOML; to allow TOML values
-    # to be used for most settings, only set the env vars you explicitly want
-    # to override here (leave others unset so they fall back to the TOML file).
-    volumes:
-      # Map the repository example config (read-only) into the container.
-      # Copy or rename `config.example.toml` to `config.toml` for production
-      # use, or edit the example in-place for quick testing.
-      - ./config.example.toml:/etc/tidal-dl/config.toml:ro
+      - "5050:5050"
+    # Secrets (DOWNLOAD_TOKEN) are injected at runtime from a local .env file
+    # (gitignored) rather than being baked into the image.
+    env_file:
+      - .env
     environment:
-      # We intentionally set only the runtime host/port here so the TOML file
-      # can provide defaults for other settings like `TIDAL_DL_BIN` or
-      # `DOWNLOAD_TOKEN` unless explicitly overridden.
-      FLASK_HOST: "${FLASK_HOST:-0.0.0.0}"
-      FLASK_PORT: "${CONTAINER_PORT:-5050}"
-      # Do NOT set these here if you want the TOML values to take effect:
-      # TIDAL_DL_BIN: "${TIDAL_DL_BIN:-tidal-dl-ng}"
-      # DOWNLOAD_TIMEOUT: "${DOWNLOAD_TIMEOUT:-0}"
-      # DOWNLOAD_TOKEN: "${DOWNLOAD_TOKEN:-}"
-    restart: unless-stopped
+      - TZ=America/Detroit
+      - DOWNLOAD_TIMEOUT=0
+    volumes:
+      # Persists tidal-dl-ng's login session (token.json) and settings
+      # (settings.json) across container recreation/updates, so you don't
+      # have to run `tidal-dl-ng login` again.
+      - tidal_dl_config:/home/app/.config/tidal_dl_ng
+      # Where downloads actually land. Point this at wherever your music
+      # library lives; download_base_path in settings.json is set to
+      # /downloads to match.
+      - /mnt/prox_host/media/music:/downloads
+
+volumes:
+  tidal_dl_config:

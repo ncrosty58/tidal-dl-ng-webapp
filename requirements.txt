@@ -1,4 +1,10 @@
 Flask>=2.0
- 
+gunicorn>=21.2.0
+
+# tidal-dl-ng is no longer published on PyPI and its upstream GitHub repo
+# (exislow/tidal-dl-ng) is gone as of 2026-07-19; installed from the vendored
+# wheel instead. See vendor/README.md for provenance.
+./vendor/tidal_dl_ng-0.32.0-py3-none-any.whl
+
 # Optional: tomli for TOML parsing on Python < 3.11 (pinned to the currently installed version)
 tomli==2.3.0 ; python_version < '3.11'

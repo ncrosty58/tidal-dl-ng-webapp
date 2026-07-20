@@ -6,7 +6,9 @@ __pycache__/
 downloads/
 .DS_Store
 nohup.out
+.app_pid
 *.bak
+config.toml
 
 # Ignore VS Code workspace folder entirely (do not commit personal settings)
 .vscode/

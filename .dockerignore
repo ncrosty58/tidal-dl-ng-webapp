@@ -1,0 +1,16 @@
+.git
+.gitignore
+.vscode
+venv
+__pycache__
+*.pyc
+*.bak
+*.log
+nohup.out
+.app_pid
+.env
+downloads/
+config.toml
+README.md
+CONTRIBUTING.md
+LICENSE
